@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -69,7 +70,6 @@ class PrintHandler(BaseHTTPRequestHandler):
         )
 
     def _read_body(self) -> tuple:
-        """Read full request body. Returns (bytes | None, error_sent: bool)."""
         cl = self.headers.get("Content-Length")
         if not cl:
             self._send_json(411, {"ok": False, "error": "missing_content_length"})
@@ -223,6 +223,78 @@ class PrintHandler(BaseHTTPRequestHandler):
     def _post_print(self, params):
         content_type = self.headers.get("Content-Type", "").lower()
 
+        # ── NUEVO: soporte para JSON con URL ──────────────────────────────────
+        # Otimify no puede enviar binarios, manda un JSON con la URL del PDF.
+        # Ejemplo: {"url": "https://cdn.otimify.com/archivo.pdf"}
+        if "application/json" in content_type:
+            body, err = self._read_body()
+            if err:
+                return
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                self._send_json(400, {"ok": False, "error": "invalid_json", "detail": str(e)})
+                return
+
+            url = data.get("url", "").strip()
+            if not url:
+                self._send_json(400, {"ok": False, "error": "url_required",
+                                      "detail": "JSON body must contain a 'url' field with the PDF link"})
+                return
+
+            # Descargar el PDF desde la URL
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "PrintServer/1.0"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    pdf_bytes = resp.read()
+            except Exception as e:
+                self._send_json(500, {"ok": False, "error": "download_failed",
+                                      "detail": str(e), "url": url})
+                return
+
+            # Procesar e imprimir el PDF descargado
+            filename   = url.split("/")[-1].split("?")[0]  # nombre del archivo de la URL
+            label_type = (params.get("type", [None])[0]
+                          or self.headers.get("X-Label-Type")
+                          or detect_type(pdf_bytes, filename))
+
+            temp_dir = tempfile.mkdtemp(prefix="printapi_")
+            try:
+                img        = pdf_to_label_image(pdf_bytes, label_type)
+                img        = img.rotate(180, expand=True)
+                print_path = os.path.join(temp_dir, "label.png")
+                img.save(print_path)
+
+                cmd = [
+                    "lp", "-d", PRINTER_NAME,
+                    "-o", f"media={LABEL_MEDIA}",
+                    "-o", "orientation-requested=3",
+                    "-o", f"printer-resolution={PRINTER_DPI}dpi",
+                    "-o", "scaling=100",
+                    print_path,
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+                if result.returncode != 0:
+                    self._send_json(500, {"ok": False, "error": "print_failed",
+                                          "stdout": result.stdout.strip(),
+                                          "stderr": result.stderr.strip()})
+                    return
+
+                self._send_json(200, {
+                    "ok": True, "message": "print_submitted",
+                    "printer": PRINTER_NAME,
+                    "source": "url",
+                    "detected_label_type": label_type,
+                    "lp_output": result.stdout.strip(),
+                })
+            except Exception as e:
+                self._send_json(500, {"ok": False, "error": "server_error", "detail": str(e)})
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            return
+        # ── FIN del bloque JSON/URL ───────────────────────────────────────────
+
         allowed_types = {
             "application/pdf": ".pdf",
             "image/jpeg":      ".jpg",
@@ -236,7 +308,7 @@ class PrintHandler(BaseHTTPRequestHandler):
 
         if not matched_type:
             self._send_json(400, {"ok": False, "error": "invalid_content_type",
-                                  "expected": list(allowed_types.keys())})
+                                  "expected": list(allowed_types.keys()) + ["application/json (with url field)"]})
             return
 
         body, err = self._read_body()
