@@ -5,6 +5,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -69,7 +70,6 @@ class PrintHandler(BaseHTTPRequestHandler):
         )
 
     def _read_body(self) -> tuple:
-        """Read full request body. Returns (bytes | None, error_sent: bool)."""
         cl = self.headers.get("Content-Length")
         if not cl:
             self._send_json(411, {"ok": False, "error": "missing_content_length"})
@@ -250,61 +250,47 @@ class PrintHandler(BaseHTTPRequestHandler):
                             request_body_log=request_body_log)
             return
 
-        temp_dir = tempfile.mkdtemp(prefix="printapi_")
-        try:
-            if matched_type == "application/pdf":
-                filename   = self.headers.get("X-Filename", "")
-                label_type = (params.get("type", [None])[0]
-                              or self.headers.get("X-Label-Type")
-                              or detect_type(body, filename))
-                img        = pdf_to_label_image(body, label_type)
-                img        = img.rotate(180, expand=True)
-                print_path = os.path.join(temp_dir, "label.png")
-                img.save(print_path)
-                extra_info = {"detected_label_type": label_type}
-            else:
-                upload_path = os.path.join(temp_dir, f"job{matched_ext}")
-                with open(upload_path, "wb") as f:
-                    f.write(body)
-                print_path = os.path.join(temp_dir, f"resized{matched_ext}")
-                self._resize_image_for_label(upload_path, print_path)
-                extra_info = {}
+        # Responder inmediatamente para no hacer timeout a Otimify
+        self._send_json(200, {"ok": True, "message": "print_queued", "printer": PRINTER_NAME},
+                        request_body_log=request_body_log)
 
-            cmd = [
-                "lp",
-                "-d", PRINTER_NAME,
-                "-o", f"media={LABEL_MEDIA}",
-                "-o", "orientation-requested=3",
-                "-o", f"printer-resolution={PRINTER_DPI}dpi",
-                "-o", "scaling=100",
-                print_path,
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        # Guardar headers necesarios antes del hilo
+        filename = self.headers.get("X-Filename", "")
+        label_type_header = self.headers.get("X-Label-Type")
+        label_type_param = params.get("type", [None])[0]
 
-            if result.returncode != 0:
-                self._send_json(
-                    500,
-                    {"ok": False, "error": "print_failed",
-                     "stdout": result.stdout.strip(), "stderr": result.stderr.strip()},
-                    request_body_log=request_body_log,
-                    extra={"lp_command": cmd, "lp_returncode": result.returncode,
-                           "content_type": matched_type, **extra_info},
-                )
-                return
+        # Procesar e imprimir en segundo plano
+        def process_and_print():
+            temp_dir = tempfile.mkdtemp(prefix="printapi_")
+            try:
+                if matched_type == "application/pdf":
+                    label_type = (label_type_param
+                                  or label_type_header
+                                  or detect_type(body, filename))
+                    img = pdf_to_label_image(body, label_type)
+                    img = img.rotate(180, expand=True)
+                    print_path = os.path.join(temp_dir, "label.png")
+                    img.save(print_path)
+                else:
+                    upload_path = os.path.join(temp_dir, f"job{matched_ext}")
+                    with open(upload_path, "wb") as f:
+                        f.write(body)
+                    print_path = os.path.join(temp_dir, f"resized{matched_ext}")
+                    self._resize_image_for_label(upload_path, print_path)
 
-            self._send_json(
-                200,
-                {"ok": True, "message": "print_submitted", "printer": PRINTER_NAME,
-                 "content_type": matched_type, "lp_output": result.stdout.strip(), **extra_info},
-                request_body_log=request_body_log,
-                extra={"lp_command": cmd, "lp_returncode": result.returncode,
-                       "content_type": matched_type, **extra_info},
-            )
+                cmd = [
+                    "lp",
+                    "-d", PRINTER_NAME,
+                    "-o", f"media={LABEL_MEDIA}",
+                    "-o", "orientation-requested=3",
+                    "-o", f"printer-resolution={PRINTER_DPI}dpi",
+                    "-o", "scaling=100",
+                    print_path,
+                ]
+                subprocess.run(cmd, capture_output=True, text=True, check=False)
+            except Exception:
+                pass
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
-        except Exception as e:
-            self._send_json(
-                500, {"ok": False, "error": "server_error", "detail": str(e)},
-                request_body_log=request_body_log,
-            )
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        threading.Thread(target=process_and_print, daemon=True).start()
